@@ -6,10 +6,8 @@ defmodule RefInspector do
   use Application
 
   def start(_type, _args) do
-    import Supervisor.Spec
-
     options  = [ strategy: :one_for_one, name: RefInspector.Supervisor ]
-    children = [ worker(RefInspector.Database, []), RefInspector.Pool.child_spec ]
+    children = [ ]
 
     sup = Supervisor.start_link(children, options)
     :ok = RefInspector.Config.yaml_path |> load()
@@ -27,5 +25,5 @@ defmodule RefInspector do
   Parses a referer.
   """
   @spec parse(String.t) :: map
-  defdelegate parse(ref), to: RefInspector.Pool
+  defdelegate parse(ref), to: RefInspector.Database
 end

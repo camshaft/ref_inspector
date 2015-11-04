@@ -34,8 +34,7 @@ defmodule RefInspector.Mixfile do
   end
 
   def deps(_) do
-    [ { :poolboy, "~> 1.0" },
-      { :yamerl,  github: "yakaz/yamerl" } ]
+    [ { :yamerl,  github: "yakaz/yamerl" } ]
   end
 
   def docs do

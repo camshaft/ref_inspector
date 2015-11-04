@@ -3,59 +3,28 @@ defmodule RefInspector.Database do
   Referer database.
   """
 
-  use GenServer
+  def parse(ref, internal \\ Application.get_env(:ref_inspector, :internal, [])) do
+    uri = ref |> URI.parse()
+    host = uri.host || ""
 
-  @ets_table      :ref_inspector
-  @ets_table_refs :ref_inspector_refs
-  @ets_counter    :referers
-
-
-  # GenServer lifecycle
-
-  @doc """
-  Starts the database server.
-  """
-  @spec start_link(any) :: GenServer.on_start
-  def start_link(default \\ []) do
-    GenServer.start_link(__MODULE__, default, [ name: __MODULE__ ])
+    if String.ends_with?(host, internal) do
+      %RefInspector.Result{medium: :internal, referer: ref}
+    else
+      %{uri | host: reverse_host(host),
+              path: uri.path || "/"}
+      |> __MODULE__.Referers.match()
+      |> Map.put(:referer, ref)
+    end
   end
-
-  def init(_) do
-    _tid = :ets.new(@ets_table,      [ :set,         :protected, :named_table ])
-    _tid = :ets.new(@ets_table_refs, [ :ordered_set, :protected, :named_table ])
-
-    :ets.insert(@ets_table, [{ @ets_counter, 0 }])
-
-    { :ok, [] }
-  end
-
-
-  # GenServer callbacks
-
-  def handle_call({ :load, file }, _from, state) do
-    { :reply, load_file(file), state }
-  end
-
-
-  # Convenience methods
-
-  @doc """
-  Returns all referer definitions.
-  """
-  @spec list() :: list
-  def list(), do: :ets.tab2list(@ets_table_refs)
 
   @doc """
   Loads a referer database file.
   """
   @spec load(String.t) :: :ok | { :error, String.t }
-  def load(nil),  do: :ok
-  def load(file), do: GenServer.call(__MODULE__, { :load, file })
-
-
-  # Internal methods
-
-  defp load_file(file) do
+  def load(nil) do
+    :ok
+  end
+  def load(file) do
     if File.regular?(file) do
       parse_file(file)
     else
@@ -63,55 +32,57 @@ defmodule RefInspector.Database do
     end
   end
 
+  @doc false
+  @spec parse_query(String.t, List.t) :: String.t | :none
+  def parse_query(nil, _), do: :none
+  def parse_query(query, params) do
+    query
+    |> URI.decode_query()
+    |> extract_parameter_value(params)
+  end
+
   defp parse_file(file) do
-    :yamerl_constr.file(file, [ :str_node_as_binary ])
-      |> hd()
-      |> parse_entries()
+    file
+    |> :yamerl_constr.file([ :str_node_as_binary ])
+    |> hd()
+    |> Enum.flat_map(&parse_entry/1)
+    |> compile_module()
+    |> Code.eval_quoted()
+    :ok
   end
 
-  defp parse_entries([]),                              do: :ok
-  defp parse_entries([{ medium, sources } | entries ]) do
+  defp parse_entry({ medium, sources }) do
+    medium = String.to_atom(medium)
     sources
-    |> parse_sources([])
+    |> parse_sources(medium, [])
     |> sort_sources()
-    |> store_ref(medium)
-
-    parse_entries(entries)
+    |> compile_sources()
   end
-
-  defp store_ref(sources, medium) do
-    medium  = String.to_atom(medium)
-    dataset = { medium, sources }
-
-    :ets.insert_new(@ets_table_refs, { update_counter(), dataset })
-  end
-
-  defp update_counter(), do: :ets.update_counter(@ets_table, @ets_counter, 1)
-
 
   # Parsing and sorting methods
 
-  defp parse_domains(_,      [],                   acc), do: acc
-  defp parse_domains(source, [ domain | domains ], acc)  do
-    uri  = URI.parse("http://#{ domain }")
-    data =
-         source
-      |> Map.put(:host, uri.host)
-      |> Map.put(:path, uri.path || "/")
-
-    parse_domains(source, domains, acc ++ [ data ])
-  end
-
-  defp parse_sources([],                             acc), do: acc
-  defp parse_sources([{ name, details } | sources ], acc)  do
+  defp parse_sources([], _, acc), do: acc
+  defp parse_sources([{ name, details } | sources ], medium, acc)  do
     details    = details |> Enum.into(%{})
     domains    = Map.get(details, "domains", [])
     parameters = Map.get(details, "parameters", [])
 
-    source = %{ name: name, parameters: parameters }
-    acc    = acc ++ parse_domains(source, domains, [])
+    source = %{ name: name, parameters: parameters, medium: medium }
+    acc    = parse_domains(source, domains, acc)
 
-    parse_sources(sources, acc)
+    parse_sources(sources, medium, acc)
+  end
+
+  defp parse_domains(_, [], acc), do: acc
+  defp parse_domains(source, [ domain | domains ], acc)  do
+    uri  = URI.parse("http://#{ domain }")
+
+    host = reverse_host(uri.host || "")
+    path = uri.path || "/"
+
+    acc = [Map.merge(source, %{host: host, path: path}) | acc]
+
+    parse_domains(source, domains, acc)
   end
 
   defp sort_sources(sources) do
@@ -120,5 +91,50 @@ defmodule RefInspector.Database do
     |> Enum.sort( &(String.length(&1[:sort]) > String.length(&2[:sort])) )
     |> Enum.uniq( &(&1[:sort]) )
     |> Enum.map( &Map.delete(&1, :sort) )
+  end
+
+  defp compile_sources(sources) do
+    for %{host: host, path: path, medium: medium,
+          name: name, parameters: parameters} <- sources do
+      quote do
+        def match(%{host: unquote(host) <> _,
+                    path: unquote(path) <> _,
+                    query: query}) do
+          %unquote(RefInspector.Result){
+            medium: unquote(medium),
+            source: unquote(name),
+            term: unquote(__MODULE__).parse_query(query, unquote(parameters))
+          }
+        end
+      end
+    end
+  end
+
+  defp extract_parameter_value(_, []), do: :none
+  defp extract_parameter_value(query, [param | params]) do
+    case Map.get(query, param) do
+      nil ->
+        extract_parameter_value(query, params)
+      value ->
+        value
+    end
+  end
+
+  defp compile_module(sources) do
+    quote do
+      defmodule unquote(__MODULE__).Referers do
+        unquote_splicing(sources)
+        def match(_) do
+          %RefInspector.Result{}
+        end
+      end
+    end
+  end
+
+  defp reverse_host(host) do
+    host
+    |> String.split(".")
+    |> Enum.reverse()
+    |> Enum.join(".")
   end
 end
